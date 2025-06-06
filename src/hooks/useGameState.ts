@@ -42,6 +42,7 @@ export const useGameState = (
 
     const setupGame = async () => {
       try {
+        console.log('Setting up game...');
         const { x, y } = getCenterPosition(gameConfig);
         playerId = uuidv4();
         const playerColor = getRandomColor();
@@ -54,32 +55,45 @@ export const useGameState = (
           color: playerColor,
         };
         
+        console.log('Adding new player to database:', newPlayer);
         await addPlayer(newPlayer);
+        
         if (!isMounted) {
-          if (playerId) removePlayer(playerId);
+          console.log('Component unmounted during setup, cleaning up...');
+          if (playerId) await removePlayer(playerId);
           return;
         }
         
         setCurrentPlayer(newPlayer);
         
+        console.log('Fetching initial players list...');
         const initialPlayers = await getPlayers();
+        console.log('Initial players:', initialPlayers);
+        
         setPlayers(initialPlayers);
         setIsConnected(true);
 
         // Connect to WebSocket
+        console.log('Connecting to WebSocket...');
         gameWebSocket.connect();
 
       } catch (err) {
         console.error('Error setting up game:', err);
-        setError('Failed to connect to the game server. Check Supabase setup.');
+        setError('Failed to connect to the game server. Please check your connection and try again.');
+        setIsConnected(false);
       }
     };
 
     setupGame();
 
-    const handleBeforeUnload = () => {
+    const handleBeforeUnload = async () => {
+      console.log('Window unloading, cleaning up...');
       if (playerId) {
-        removePlayer(playerId);
+        try {
+          await removePlayer(playerId);
+        } catch (err) {
+          console.error('Error removing player during unload:', err);
+        }
       }
       gameWebSocket.disconnect();
     };
@@ -87,10 +101,13 @@ export const useGameState = (
     window.addEventListener('beforeunload', handleBeforeUnload);
 
     return () => {
+      console.log('Component unmounting, cleaning up...');
       isMounted = false;
       window.removeEventListener('beforeunload', handleBeforeUnload);
       if (playerId) {
-        removePlayer(playerId);
+        removePlayer(playerId).catch(err => {
+          console.error('Error removing player during cleanup:', err);
+        });
       }
       gameWebSocket.disconnect();
     };
@@ -115,36 +132,59 @@ export const useGameState = (
     const subscription = subscribeToPlayers(
       (updatedPlayers: Player[], eventType: string) => {
         const playerRecord = updatedPlayers[0];
-        if (!playerRecord) return;
+        if (!playerRecord) {
+          console.warn('Received empty player record in event:', eventType);
+          return;
+        }
+
+        console.log('Processing player event:', {
+          type: eventType,
+          playerId: playerRecord.id,
+          playerName: playerRecord.name
+        });
 
         switch (eventType) {
           case 'INSERT':
-            setPlayers((prev) =>
-              prev.some((p) => p.id === playerRecord.id)
-                ? prev
-                : [...prev, playerRecord]
-            );
+            setPlayers((prev) => {
+              // Проверяем, не является ли это текущим игроком
+              if (playerRecord.id === currentPlayer?.id) {
+                console.log('Ignoring INSERT event for current player');
+                return prev;
+              }
+              console.log('Adding new player to state:', playerRecord);
+              return [...prev, playerRecord];
+            });
             break;
           case 'UPDATE':
-            setPlayers((prev) =>
-              prev.map((p) => {
-                if (p.id === playerRecord.id) {
-                  if (p.id === currentPlayer?.id) {
+            setPlayers((prev) => {
+              // Если это текущий игрок, сохраняем его текущую позицию
+              if (playerRecord.id === currentPlayer?.id) {
+                console.log('Updating current player while preserving position');
+                return prev.map((p) => {
+                  if (p.id === currentPlayer.id) {
                     return {
                       ...playerRecord,
                       x: currentPlayer.x,
                       y: currentPlayer.y,
                     };
                   }
-                  return { ...p, ...playerRecord };
-                }
-                return p;
-              })
-            );
+                  return p;
+                });
+              }
+              console.log('Updating player in state:', playerRecord);
+              return prev.map((p) => 
+                p.id === playerRecord.id ? { ...p, ...playerRecord } : p
+              );
+            });
             break;
           case 'DELETE':
-            setPlayers((prev) => prev.filter((p) => p.id !== playerRecord.id));
+            setPlayers((prev) => {
+              console.log('Removing player from state:', playerRecord.id);
+              return prev.filter((p) => p.id !== playerRecord.id);
+            });
             break;
+          default:
+            console.warn('Unknown event type:', eventType);
         }
       }
     );
@@ -172,25 +212,19 @@ export const useGameState = (
       if (x !== currentPlayer.x || y !== currentPlayer.y) {
         const newPlayerState = { ...currentPlayer, x, y };
 
+        // Немедленно обновляем локальное состояние
         setCurrentPlayer(newPlayerState);
         setPlayers((prevPlayers) =>
           prevPlayers.map((p) => (p.id === currentPlayer.id ? newPlayerState : p))
         );
 
-        const now = Date.now();
-        if (now - lastUpdateTime.current > 50) { // Reduced update interval for smoother movement
-          lastUpdateTime.current = now;
-          
-          // Отправляем обновление через WebSocket
-          gameWebSocket.sendPosition(currentPlayer.id, x, y);
-          
-          // Обновляем в Supabase только каждые 500мс для уменьшения нагрузки
-          if (now % 500 < 50) {
-            updatePlayerPosition(currentPlayer.id, x, y).catch((err) => {
-              console.error('Failed to sync position to Supabase:', err);
-            });
-          }
-        }
+        // Отправляем обновление через WebSocket без задержки
+        gameWebSocket.sendPosition(currentPlayer.id, x, y);
+        
+        // Обновляем в Supabase без задержки
+        updatePlayerPosition(currentPlayer.id, x, y).catch((err) => {
+          console.error('Failed to sync position to Supabase:', err);
+        });
       }
     },
     [currentPlayer, gameConfig]

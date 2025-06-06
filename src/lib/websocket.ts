@@ -21,7 +21,6 @@ class GameWebSocket {
 
   connect() {
     if (this.isConnecting) {
-      console.log('Already connecting...');
       return;
     }
 
@@ -36,19 +35,19 @@ class GameWebSocket {
         this.reconnectAttempts = 0;
         this.isConnecting = false;
         
-        // Отправляем все накопленные сообщения
-        while (this.messageQueue.length > 0) {
-          const message = this.messageQueue.shift();
+        // Отправляем последнее сообщение из очереди
+        if (this.messageQueue.length > 0) {
+          const message = this.messageQueue[this.messageQueue.length - 1];
           if (message && this.ws?.readyState === WebSocket.OPEN) {
             this.ws.send(message);
           }
+          this.messageQueue = [];
         }
       };
 
       this.ws.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data) as WebSocketMessage;
-          console.log('Received WebSocket message:', message);
           this.messageHandlers.forEach(handler => handler(message));
         } catch (error) {
           console.error('Error parsing WebSocket message:', error);
@@ -99,8 +98,8 @@ class GameWebSocket {
     });
 
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      console.log('WebSocket not ready, queueing message');
-      this.messageQueue.push(message);
+      // Если WebSocket не готов, сохраняем только последнее сообщение
+      this.messageQueue = [message];
       
       if (!this.isConnecting) {
         this.connect();
@@ -108,15 +107,12 @@ class GameWebSocket {
       return;
     }
 
-    console.log('Sending position update:', { playerId, x, y });
     this.ws.send(message);
   }
 
   onMessage(handler: (message: WebSocketMessage) => void) {
-    console.log('Adding message handler');
     this.messageHandlers.push(handler);
     return () => {
-      console.log('Removing message handler');
       this.messageHandlers = this.messageHandlers.filter(h => h !== handler);
     };
   }

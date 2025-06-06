@@ -42,30 +42,11 @@ export const updatePlayerPosition = async (
   y: number
 ): Promise<void> => {
   try {
-    console.log('Updating player position:', { id, x, y });
-    
-    // Сначала проверяем, существует ли игрок
-    const { data: existingPlayer, error: fetchError } = await supabase
-      .from('players')
-      .select('id')
-      .eq('id', id)
-      .single();
-
-    if (fetchError) {
-      console.error('Error checking player existence:', fetchError);
-      throw fetchError;
-    }
-
-    if (!existingPlayer) {
-      console.error('Player not found:', id);
-      return;
-    }
-
     const { error } = await supabase
       .from('players')
       .update({ 
-        x: Math.floor(x), // Округляем вниз до целого числа
-        y: Math.floor(y)  // Округляем вниз до целого числа
+        x: Math.floor(x),
+        y: Math.floor(y)
       })
       .eq('id', id);
 
@@ -118,13 +99,12 @@ export const getPlayers = async (): Promise<Player[]> => {
 export const subscribeToPlayers = (
   callback: (players: Player[], eventType: string) => void
 ) => {
-  return supabase
+  const channel = supabase
     .channel('players-channel')
     .on(
       'postgres_changes',
       { event: 'INSERT', schema: 'public', table: 'players' },
       (payload) => {
-        console.log('Player inserted:', payload);
         callback([payload.new as Player], 'INSERT');
       }
     )
@@ -132,7 +112,6 @@ export const subscribeToPlayers = (
       'postgres_changes',
       { event: 'UPDATE', schema: 'public', table: 'players' },
       (payload) => {
-        console.log('Player updated:', payload);
         callback([payload.new as Player], 'UPDATE');
       }
     )
@@ -140,11 +119,12 @@ export const subscribeToPlayers = (
       'postgres_changes',
       { event: 'DELETE', schema: 'public', table: 'players' },
       (payload) => {
-        console.log('Player deleted:', payload);
         callback([{ id: payload.old.id } as Player], 'DELETE');
       }
     )
     .subscribe();
+
+  return channel;
 };
 
 export const updatePlayerName = async (id: string, name: string) => {
