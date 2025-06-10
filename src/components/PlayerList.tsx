@@ -13,7 +13,7 @@ const PlayerList: React.FC<PlayerListProps> = ({ players, currentPlayerId }) => 
   return (
     <div className="bg-gray-800 rounded-lg p-4 shadow-lg">
       <h2 className="text-xl font-bold mb-4 text-white flex items-center">
-        <User className="inline-block mr-2\" size={18} />
+        <User className="inline-block mr-2" size={18} />
         Players ({players.length})
       </h2>
       
@@ -21,20 +21,23 @@ const PlayerList: React.FC<PlayerListProps> = ({ players, currentPlayerId }) => 
         {sortedPlayers.map((player) => (
           <div
             key={player.id}
-            className={`flex items-center p-2 rounded ${
+            className={`flex items-center p-2 rounded transition-all duration-300 ${
               player.id === currentPlayerId
                 ? 'bg-gray-700'
                 : 'bg-gray-900'
             }`}
           >
-            <div
-              className="w-4 h-4 mr-3 rounded-sm"
-              style={{ backgroundColor: player.color }}
-            />
-            <span className="text-white">
-              {player.name}
-              {player.id === currentPlayerId && ' (you)'}
-            </span>
+            <div className="flex items-center">
+              <div
+                className="w-4 h-4 mr-3 rounded-sm"
+                style={{ backgroundColor: player.color }}
+              />
+              <span className="text-white">
+                {player.name}
+                {player.id === currentPlayerId && ' (you)'}
+              </span>
+              <div className="ml-2 w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+            </div>
           </div>
         ))}
       </div>

@@ -77,6 +77,13 @@ export const useGameState = (
         console.log('Connecting to WebSocket...');
         gameWebSocket.connect();
 
+        // Отправляем сообщение о подключении игрока
+        gameWebSocket.sendPlayerJoined({
+          id: newPlayer.id,
+          name: newPlayer.name,
+          color: newPlayer.color
+        });
+
       } catch (err) {
         console.error('Error setting up game:', err);
         setError('Failed to connect to the game server. Please check your connection and try again.');
@@ -86,30 +93,47 @@ export const useGameState = (
 
     setupGame();
 
-    const handleBeforeUnload = async () => {
-      console.log('Window unloading, cleaning up...');
+    const cleanup = async () => {
+      console.log('Cleaning up player session...');
       if (playerId) {
         try {
+          // Отправляем уведомление о выходе через WebSocket
+          gameWebSocket.sendPlayerLeft(playerId);
+          // Удаляем игрока из базы данных
           await removePlayer(playerId);
         } catch (err) {
-          console.error('Error removing player during unload:', err);
+          console.error('Error during cleanup:', err);
         }
       }
       gameWebSocket.disconnect();
     };
 
+    const handleBeforeUnload = async (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      await cleanup();
+    };
+
+    const handleVisibilityChange = async () => {
+      if (document.visibilityState === 'hidden') {
+        await cleanup();
+      }
+    };
+
+    const handlePageHide = async () => {
+      await cleanup();
+    };
+
     window.addEventListener('beforeunload', handleBeforeUnload);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', handlePageHide);
 
     return () => {
       console.log('Component unmounting, cleaning up...');
       isMounted = false;
       window.removeEventListener('beforeunload', handleBeforeUnload);
-      if (playerId) {
-        removePlayer(playerId).catch(err => {
-          console.error('Error removing player during cleanup:', err);
-        });
-      }
-      gameWebSocket.disconnect();
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', handlePageHide);
+      cleanup();
     };
   }, [initialName, gameConfig]);
 
@@ -118,13 +142,44 @@ export const useGameState = (
 
     // WebSocket message handler
     const unsubscribe = gameWebSocket.onMessage((message) => {
-      if (message.type === 'position') {
-        const { playerId, x, y } = message.payload;
-        if (playerId !== currentPlayer?.id) {
-          setPlayers(prev => prev.map(p => 
-            p.id === playerId ? { ...p, x, y } : p
-          ));
-        }
+      console.log('Processing WebSocket message:', message);
+      
+      switch (message.type) {
+        case 'position':
+          const { playerId, x, y } = message.payload;
+          if (playerId !== currentPlayer?.id && x !== undefined && y !== undefined) {
+            setPlayers(prev => prev.map(p => 
+              p.id === playerId ? { ...p, x, y } : p
+            ));
+          }
+          break;
+
+        case 'player_joined':
+          const { playerId: joinedPlayerId, name, color } = message.payload;
+          if (joinedPlayerId !== currentPlayer?.id) {
+            setPlayers(prev => {
+              if (prev.some(p => p.id === joinedPlayerId)) {
+                return prev;
+              }
+              const player: Player = {
+                id: joinedPlayerId,
+                name: name || `Player-${joinedPlayerId.substring(0, 4)}`,
+                x: 0,
+                y: 0,
+                color: color || getRandomColor()
+              };
+              return [...prev, player];
+            });
+          }
+          break;
+
+        case 'player_left':
+          const { playerId: leftPlayerId } = message.payload;
+          setPlayers(prev => prev.filter(p => p.id !== leftPlayerId));
+          break;
+
+        default:
+          console.warn('Unknown message type:', message.type);
       }
     });
 
@@ -218,13 +273,17 @@ export const useGameState = (
           prevPlayers.map((p) => (p.id === currentPlayer.id ? newPlayerState : p))
         );
 
-        // Отправляем обновление через WebSocket без задержки
+        // Отправляем обновление через WebSocket
         gameWebSocket.sendPosition(currentPlayer.id, x, y);
         
-        // Обновляем в Supabase без задержки
-        updatePlayerPosition(currentPlayer.id, x, y).catch((err) => {
-          console.error('Failed to sync position to Supabase:', err);
-        });
+        // Обновляем в Supabase с задержкой
+        const now = Date.now();
+        if (now - lastUpdateTime.current > 100) { // Обновляем Supabase каждые 100мс
+          lastUpdateTime.current = now;
+          updatePlayerPosition(currentPlayer.id, x, y).catch((err) => {
+            console.error('Failed to sync position to Supabase:', err);
+          });
+        }
       }
     },
     [currentPlayer, gameConfig]

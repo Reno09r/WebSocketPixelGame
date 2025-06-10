@@ -14,7 +14,7 @@ const GAME_CONFIG: GameConfig = {
   fieldWidth: 200,
   fieldHeight: 150,
   playerSize: 1,
-  moveSpeed: 0.2,
+  moveSpeed: 0.1,
 };
 
 const isSupabaseConfigured =

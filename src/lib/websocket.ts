@@ -2,7 +2,13 @@ import { Player } from '../types/game';
 
 type WebSocketMessage = {
   type: 'position' | 'player_joined' | 'player_left';
-  payload: any;
+  payload: {
+    playerId: string;
+    x?: number;
+    y?: number;
+    name?: string;
+    color?: string;
+  };
 };
 
 class GameWebSocket {
@@ -13,6 +19,10 @@ class GameWebSocket {
   private messageHandlers: ((message: WebSocketMessage) => void)[] = [];
   private isConnecting = false;
   private messageQueue: string[] = [];
+  private lastPositionUpdate = 0;
+  private positionUpdateInterval = 1000 / 60; // 60 FPS
+  private positionBuffer: Map<string, { x: number; y: number }> = new Map();
+  private positionUpdateTimer: number | null = null;
 
   constructor(private url: string) {
     console.log('WebSocket URL:', url);
@@ -35,19 +45,22 @@ class GameWebSocket {
         this.reconnectAttempts = 0;
         this.isConnecting = false;
         
-        // Отправляем последнее сообщение из очереди
-        if (this.messageQueue.length > 0) {
-          const message = this.messageQueue[this.messageQueue.length - 1];
+        // Отправляем все сообщения из очереди
+        while (this.messageQueue.length > 0) {
+          const message = this.messageQueue.shift();
           if (message && this.ws?.readyState === WebSocket.OPEN) {
             this.ws.send(message);
           }
-          this.messageQueue = [];
         }
+
+        // Запускаем таймер обновления позиций
+        this.startPositionUpdates();
       };
 
       this.ws.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data) as WebSocketMessage;
+          console.log('Received WebSocket message:', message);
           this.messageHandlers.forEach(handler => handler(message));
         } catch (error) {
           console.error('Error parsing WebSocket message:', error);
@@ -57,6 +70,7 @@ class GameWebSocket {
       this.ws.onclose = (event) => {
         console.log('WebSocket disconnected:', event.code, event.reason);
         this.isConnecting = false;
+        this.stopPositionUpdates();
         this.attemptReconnect();
       };
 
@@ -69,6 +83,44 @@ class GameWebSocket {
       this.isConnecting = false;
       this.attemptReconnect();
     }
+  }
+
+  private startPositionUpdates() {
+    if (this.positionUpdateTimer === null) {
+      this.positionUpdateTimer = window.setInterval(() => {
+        this.flushPositionBuffer();
+      }, this.positionUpdateInterval);
+    }
+  }
+
+  private stopPositionUpdates() {
+    if (this.positionUpdateTimer !== null) {
+      window.clearInterval(this.positionUpdateTimer);
+      this.positionUpdateTimer = null;
+    }
+  }
+
+  private flushPositionBuffer() {
+    if (this.positionBuffer.size === 0) return;
+
+    const now = Date.now();
+    if (now - this.lastPositionUpdate < this.positionUpdateInterval) return;
+
+    this.positionBuffer.forEach((position, playerId) => {
+      const message = JSON.stringify({
+        type: 'position',
+        payload: { playerId, ...position }
+      });
+
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.ws.send(message);
+      } else {
+        this.messageQueue.push(message);
+      }
+    });
+
+    this.positionBuffer.clear();
+    this.lastPositionUpdate = now;
   }
 
   private attemptReconnect() {
@@ -84,6 +136,7 @@ class GameWebSocket {
   }
 
   disconnect() {
+    this.stopPositionUpdates();
     if (this.ws) {
       console.log('Disconnecting WebSocket...');
       this.ws.close();
@@ -92,15 +145,39 @@ class GameWebSocket {
   }
 
   sendPosition(playerId: string, x: number, y: number) {
+    // Буферизируем позицию
+    this.positionBuffer.set(playerId, { x, y });
+  }
+
+  sendPlayerJoined(player: { id: string; name: string; color: string }) {
     const message = JSON.stringify({
-      type: 'position',
-      payload: { playerId, x, y }
+      type: 'player_joined',
+      payload: {
+        playerId: player.id,
+        name: player.name,
+        color: player.color
+      }
     });
 
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      // Если WebSocket не готов, сохраняем только последнее сообщение
-      this.messageQueue = [message];
-      
+      this.messageQueue.push(message);
+      if (!this.isConnecting) {
+        this.connect();
+      }
+      return;
+    }
+
+    this.ws.send(message);
+  }
+
+  sendPlayerLeft(playerId: string) {
+    const message = JSON.stringify({
+      type: 'player_left',
+      payload: { playerId }
+    });
+
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.messageQueue.push(message);
       if (!this.isConnecting) {
         this.connect();
       }
