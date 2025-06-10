@@ -1,17 +1,15 @@
-// --- START OF FILE index.ts ---
+// --- START OF FILE server/src/index.ts ---
 
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer } from 'http';
 import { removePlayer } from './supabase';
+import 'dotenv/config';
 
 // Типы сообщений
 type PositionMessage = {
   type: 'position';
   payload: { playerId: string; x: number; y: number };
 };
-
-// ИЗМЕНЕНО: Этот тип больше не нужен, используем ID при подключении
-// type ConnectionMessage = { ... };
 
 type PlayerJoinedMessage = {
   type: 'player_joined';
@@ -23,7 +21,6 @@ type PlayerLeftMessage = {
   payload: { playerId: string };
 };
 
-// ДОБАВЛЕНО: Сообщение со всем состоянием игры для нового игрока
 type GameStateMessage = {
   type: 'game_state';
   payload: {
@@ -33,10 +30,11 @@ type GameStateMessage = {
 
 type GameMessage = PositionMessage | PlayerJoinedMessage | PlayerLeftMessage | GameStateMessage;
 
-// ДОБАВЛЕНО: Интерфейс для хранения данных о клиенте
+// Интерфейс для хранения данных о клиенте на сервере
 interface ClientData {
   ws: WebSocket;
-  playerData: { id: string; name: string; color: string; x: number; y: number; };
+  // Данные об игроке становятся доступны после сообщения 'player_joined'
+  playerData?: { id: string; name: string; color: string; x: number; y: number; };
 }
 
 // Класс для управления игровым сервером
@@ -55,10 +53,8 @@ class GameServer {
     });
   }
 
-  // ИЗМЕНЕНО: handleConnection теперь принимает ID от клиента
   private handleConnection(ws: WebSocket, req: any) {
-    // Клиент должен передать свой ID в URL, например: ws://localhost:3001?playerId=...
-    // Это более надежно, чем генерировать ID на сервере после создания игрока в БД.
+    // Получаем ID клиента из URL-параметров
     const url = new URL(req.url, `http://${req.headers.host}`);
     const clientId = url.searchParams.get('playerId');
 
@@ -70,20 +66,13 @@ class GameServer {
 
     console.log(`Client connected: ${clientId}`);
 
-    // Отправляем новому клиенту состояние всех существующих игроков
-    const allPlayers = Array.from(this.clients.values()).map(c => c.playerData);
-    const gameStateMessage: GameStateMessage = {
-      type: 'game_state',
-      payload: { players: allPlayers },
-    };
-    ws.send(JSON.stringify(gameStateMessage));
-
-    // Сохраняем клиента, но пока без playerData. Оно придет с сообщением 'player_joined'
-    this.clients.set(clientId, { ws, playerData: null! }); // null! - временное значение
+    // Сразу сохраняем WebSocket соединение клиента.
+    // Не отправляем состояние игры, ждем 'player_joined' от клиента.
+    this.clients.set(clientId, { ws });
 
     ws.on('message', (data) => {
       try {
-        const message = JSON.parse(data.toString()); // as GameMessage убрали, так как типы payload разные
+        const message = JSON.parse(data.toString());
         this.handleMessage(clientId, message);
       } catch (error) {
         console.error('Error parsing message:', error);
@@ -101,7 +90,7 @@ class GameServer {
       };
       this.broadcast(playerLeftMessage, clientId);
       
-      // ИЗМЕНЕНО: Надежное удаление из БД на сервере
+      // Надежное удаление из БД на сервере
       await removePlayer(clientId);
     });
 
@@ -110,41 +99,48 @@ class GameServer {
     });
   }
 
-  private handleMessage(senderId: string, message: any) {
-    console.log(`Received message from ${senderId}:`, message.type);
+  private handleMessage(senderId: string, message: GameMessage) {
+    console.log(`Received message from ${senderId} of type ${message.type}`);
+    const client = this.clients.get(senderId);
+    if (!client) return;
 
     switch (message.type) {
-      case 'position':
-        if (
-          typeof message.payload.x === 'number' &&
-          typeof message.payload.y === 'number'
-        ) {
-          // Обновляем позицию игрока на сервере
-          const client = this.clients.get(senderId);
-          if (client && client.playerData) {
-            client.playerData.x = message.payload.x;
-            client.playerData.y = message.payload.y;
-          }
-          this.broadcast(message, senderId);
-        } else {
-          console.error('Invalid position data:', message);
-        }
+      case 'player_joined':
+        // 1. Сохраняем полные данные об игроке на сервере.
+        client.playerData = message.payload;
+        console.log(`Player data for ${senderId} registered:`, client.playerData.name);
+
+        // 2. Отправляем ПОЛНОЕ состояние игры ТОЛЬКО этому новому клиенту.
+        // Это гарантирует, что он получит список всех, включая себя.
+        const allPlayers = Array.from(this.clients.values())
+                              .filter(c => c.playerData) // Убеждаемся, что данные игрока существуют
+                              .map(c => c.playerData!);
+                              
+        const gameStateMessage: GameStateMessage = {
+          type: 'game_state',
+          payload: { players: allPlayers },
+        };
+        client.ws.send(JSON.stringify(gameStateMessage));
+        console.log(`Sent initial game_state to ${senderId}`);
+        
+        // 3. Транслируем событие о присоединении ВСЕМ ОСТАЛЬНЫМ клиентам.
+        this.broadcast(message, senderId);
+        console.log(`Broadcasted player_joined for ${senderId} to other clients`);
         break;
 
-      // ДОБАВЛЕНО: Обработка присоединения нового игрока
-      case 'player_joined':
-        const client = this.clients.get(senderId);
-        if (client) {
-          // Сохраняем полные данные об игроке
-          client.playerData = message.payload;
-          console.log(`Player data for ${senderId} updated:`, client.playerData.name);
-          // Транслируем это событие всем остальным клиентам
+      case 'position':
+        if (client.playerData) {
+          // Обновляем позицию на сервере для консистентности
+          client.playerData.x = message.payload.x;
+          client.playerData.y = message.payload.y;
+          // Транслируем всем остальным
           this.broadcast(message, senderId);
         }
         break;
 
       default:
-        console.warn('Unknown message type:', message.type);
+        // Используем as any для доступа к message.type для логирования
+        console.warn(`Unknown message type from ${senderId}:`, (message as any).type);
     }
   }
 
@@ -156,9 +152,6 @@ class GameServer {
       }
     });
   }
-
-  // Этот метод больше не нужен, ID генерируется на клиенте
-  // private generateClientId(): string { ... }
 }
 
 const PORT = Number(process.env.PORT) || 3001;

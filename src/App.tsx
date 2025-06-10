@@ -1,6 +1,6 @@
 // --- START OF FILE App.tsx ---
 
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import GameField from './components/GameField';
 import PlayerList from './components/PlayerList';
 import GameHeader from './components/GameHeader';
@@ -8,13 +8,15 @@ import ConnectionStatus from './components/ConnectionStatus';
 import SupabaseSetupMessage from './components/SupabaseSetupMessage';
 import { useGameState } from './hooks/useGameState';
 import { useKeyboardControls } from './hooks/useKeyboardControls';
+import { useMovement } from './hooks/useMovement';
 import { GameConfig } from './types/game';
 
 const GAME_CONFIG: GameConfig = {
   fieldWidth: 200,
   fieldHeight: 150,
   playerSize: 1,
-  moveSpeed: 0.1,
+  // Скорость можно подрегулировать для комфортной игры
+  moveSpeed: 0.8,
 };
 
 const isSupabaseConfigured =
@@ -22,44 +24,27 @@ const isSupabaseConfigured =
 
 function App() {
   const [showSetupMessage] = useState(!isSupabaseConfigured);
-  // FIX: Removed 'setPlayerName' as it's no longer used.
-  // The 'playerName' constant now holds only the initial random name.
   const [playerName] = useState(`Player-${Math.floor(Math.random() * 1000)}`);
 
   const {
     players,
+    setPlayers, // Получаем setPlayers из useGameState
     currentPlayer,
     isConnected,
     error,
-    handlePlayerMove,
     updatePlayerName,
   } = useGameState(playerName, GAME_CONFIG);
 
   const movement = useKeyboardControls();
 
-  useEffect(() => {
-    let animationFrameId: number;
-
-    const gameLoop = () => {
-      handlePlayerMove(movement);
-      animationFrameId = requestAnimationFrame(gameLoop);
-    };
-
-    if (isConnected && currentPlayer) {
-      gameLoop();
-    }
-
-    return () => {
-      cancelAnimationFrame(animationFrameId);
-    };
-  }, [movement, isConnected, currentPlayer, handlePlayerMove]);
+  // Вызываем хук движения, который запускает игровой цикл
+  // Передаем только setPlayers, а не сам массив players
+  useMovement(setPlayers, movement, currentPlayer, GAME_CONFIG);
 
   const handleNameChange = (name: string) => {
     updatePlayerName(name);
   };
 
-  // This logic is correct: it uses the live name from currentPlayer if available,
-  // or falls back to the initial random name.
   const currentName = currentPlayer?.name || playerName;
 
   return (

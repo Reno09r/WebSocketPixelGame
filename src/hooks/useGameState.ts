@@ -1,12 +1,11 @@
-// --- START OF FILE useGameState.ts ---
+// --- START OF FILE src/hooks/useGameState.ts ---
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import { Player, GameConfig } from '../types/game';
 import {
   addPlayer,
   subscribeToPlayers,
-  updatePlayerPosition,
   updatePlayerName as updatePlayerNameInDb,
 } from '../lib/supabase';
 import gameWebSocket from '../lib/websocket';
@@ -32,18 +31,13 @@ export const useGameState = (
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const lastUpdateTime = useRef<number>(0);
-
-  // Основной useEffect для создания и удаления игрока. Запускается один раз.
+  // useEffect для создания игрока
   useEffect(() => {
-    let playerId: string | null = null;
     let isMounted = true;
-
     const setupGame = async () => {
       try {
-        console.log('Setting up game...');
         const { x, y } = getCenterPosition(gameConfig);
-        playerId = uuidv4();
+        const playerId = uuidv4();
         const playerColor = getRandomColor();
         
         const newPlayer: Player = {
@@ -52,86 +46,77 @@ export const useGameState = (
           x,
           y,
           color: playerColor,
+          targetX: x,
+          targetY: y,
         };
         
         await addPlayer(newPlayer);
-        
         if (!isMounted) return;
         
         setCurrentPlayer(newPlayer);
-        // Добавляем текущего игрока в общий список сразу
+        // Начальное состояние - только текущий игрок. Сервер пришлет остальных.
         setPlayers([newPlayer]);
-        
-        // Подключаемся к WebSocket, передавая наш ID
-        gameWebSocket.connect(newPlayer.id);
-
-        // Отправляем сообщение о том, что мы присоединились, со всеми нашими данными
-        gameWebSocket.sendPlayerJoined({ ...newPlayer });
-
+        gameWebSocket.connect(newPlayer);
         setIsConnected(true);
 
       } catch (err) {
         console.error('Error setting up game:', err);
-        setError('Failed to connect to the game server. Please check your connection.');
+        setError('Failed to connect to the game server.');
       }
     };
 
     setupGame();
 
     const cleanup = () => {
+      isMounted = false;
       console.log('Cleaning up game session...');
-      // Клиенту больше не нужно удалять себя из БД. Сервер сделает это по событию 'close'.
       gameWebSocket.disconnect();
     };
-
-    // Упрощенный cleanup при закрытии вкладки/окна
+    
     window.addEventListener('beforeunload', cleanup);
     
     return () => {
-      isMounted = false;
       window.removeEventListener('beforeunload', cleanup);
       cleanup();
     };
   }, [initialName, gameConfig]);
 
-  // Отдельный useEffect для обработки сообщений и подписок
+  // useEffect для обработки сообщений WebSocket и подписок Supabase
   useEffect(() => {
-    // Ждем, пока установится соединение и появится ID текущего игрока
     if (!isConnected || !currentPlayer?.id) return;
 
-    // Обработчик сообщений WebSocket
-    const handleWsMessage = (message: any) => { // Используем 'any' для гибкости payload
-      console.log('Processing WebSocket message:', message);
-      
+    // Устанавливаем обработчик для сообщений с сервера
+    const handleWsMessage = (message: any) => {
       switch (message.type) {
         case 'game_state':
-          // Устанавливаем список игроков, полученных от сервера
-          setPlayers(prev => {
-            const existingIds = new Set(prev.map(p => p.id));
-            const newPlayers = message.payload.players.filter((p: Player) => !existingIds.has(p.id));
-            return [...prev, ...newPlayers];
-          });
+          // Это сообщение приходит один раз при подключении с полным списком игроков
+          console.log("Received initial game state:", message.payload.players);
+          const playersWithTargets = message.payload.players.map((p: Player) => ({
+            ...p,
+            targetX: p.x,
+            targetY: p.y,
+          }));
+          setPlayers(playersWithTargets);
           break;
 
         case 'position':
           const { playerId, x, y } = message.payload;
+          // Обновляем целевые координаты для других игроков для плавной интерполяции
           if (playerId !== currentPlayer?.id && x !== undefined && y !== undefined) {
             setPlayers(prev => prev.map(p => 
-              p.id === playerId ? { ...p, x, y } : p
+              p.id === playerId ? { ...p, targetX: x, targetY: y } : p
             ));
           }
           break;
 
         case 'player_joined':
-          // Сервер присылает полный объект игрока
+          // Это сообщение приходит, когда ДРУГОЙ игрок присоединяется
           const newPlayerData: Player = message.payload;
           if (newPlayerData.id !== currentPlayer?.id) {
             setPlayers(prev => {
-              // Избегаем дублирования, если игрок уже есть в списке
-              if (prev.some(p => p.id === newPlayerData.id)) {
-                return prev;
-              }
-              return [...prev, newPlayerData];
+              // Предотвращаем дублирование, если игрок уже есть в списке
+              if (prev.some(p => p.id === newPlayerData.id)) return prev;
+              return [...prev, { ...newPlayerData, targetX: newPlayerData.x, targetY: newPlayerData.y }];
             });
           }
           break;
@@ -140,110 +125,63 @@ export const useGameState = (
           const { playerId: leftPlayerId } = message.payload;
           setPlayers(prev => prev.filter(p => p.id !== leftPlayerId));
           break;
-
+        
         default:
           console.warn('Unknown WebSocket message type:', message.type);
       }
     };
 
     const unsubscribeWs = gameWebSocket.onMessage(handleWsMessage);
-
-    // Подписка на Supabase для обновлений (имя, цвет и т.д.),
-    // но не для добавления/удаления игроков, так как это теперь делается через WebSocket.
+    
+    // Подписка на Supabase для обновлений имени/цвета
     const subscription = subscribeToPlayers(
       (updatedPlayers: Player[], eventType: string) => {
         const playerRecord = updatedPlayers[0];
-        if (!playerRecord) return;
-        
-        // Обновляем только данные других игроков, чтобы избежать конфликтов с локальным состоянием
-        if (eventType === 'UPDATE' && playerRecord.id !== currentPlayer?.id) {
-           console.log('Received Supabase UPDATE for other player:', playerRecord.id);
-           setPlayers((prev) =>
-             prev.map((p) =>
-               p.id === playerRecord.id ? { ...p, ...playerRecord } : p
-             )
-           );
-        } else if (eventType === 'UPDATE' && playerRecord.id === currentPlayer?.id) {
-            // Если пришло обновление для текущего игрока (например, имя изменено с другого устройства)
-            console.log('Received Supabase UPDATE for current player:', playerRecord.name);
-            setCurrentPlayer(prev => prev ? { ...prev, name: playerRecord.name, color: playerRecord.color } : null);
-            setPlayers(prev => prev.map(p => p.id === playerRecord.id ? { ...p, name: playerRecord.name, color: playerRecord.color } : p));
+        if (!playerRecord || eventType !== 'UPDATE') return;
+
+        setPlayers((prevPlayers) =>
+          prevPlayers.map((p) => 
+            p.id === playerRecord.id 
+            ? { ...p, name: playerRecord.name, color: playerRecord.color } 
+            : p
+          )
+        );
+            
+        if (playerRecord.id === currentPlayer?.id) {
+          setCurrentPlayer(prev => prev ? { ...prev, name: playerRecord.name, color: playerRecord.color } : null);
         }
       }
     );
 
     return () => {
-      if (subscription) {
-        subscription.unsubscribe();
-      }
+      subscription?.unsubscribe();
       unsubscribeWs();
     };
-  }, [isConnected, currentPlayer?.id]); // <<<< ВАЖНО: Зависимость от currentPlayer.id, а не всего объекта
-  
-  const handlePlayerMove = useCallback(
-    (movement: { up: boolean; down: boolean; left: boolean; right: boolean; }) => {
-      if (!currentPlayer) return;
-
-      const { moveSpeed, fieldWidth, fieldHeight, playerSize } = gameConfig;
-      let { x, y } = currentPlayer;
-
-      if (movement.up) y = Math.max(0, y - moveSpeed);
-      if (movement.down) y = Math.min(fieldHeight - playerSize, y + moveSpeed);
-      if (movement.left) x = Math.max(0, x - moveSpeed);
-      if (movement.right) x = Math.min(fieldWidth - playerSize, x + moveSpeed);
-      
-      if (x !== currentPlayer.x || y !== currentPlayer.y) {
-        const newPlayerState = { ...currentPlayer, x, y };
-
-        // Немедленно обновляем локальное состояние для плавности
-        setCurrentPlayer(newPlayerState);
-        setPlayers((prevPlayers) =>
-          prevPlayers.map((p) => (p.id === currentPlayer.id ? newPlayerState : p))
-        );
-
-        // Отправляем обновление через WebSocket
-        gameWebSocket.sendPosition(currentPlayer.id, x, y);
-        
-        // Обновляем в Supabase с задержкой (throttling)
-        const now = Date.now();
-        if (now - lastUpdateTime.current > 100) { // Обновляем Supabase не чаще чем раз в 100мс
-          lastUpdateTime.current = now;
-          updatePlayerPosition(currentPlayer.id, x, y).catch((err) => {
-            console.error('Failed to sync position to Supabase:', err);
-          });
-        }
-      }
-    },
-    [currentPlayer, gameConfig]
-  );
+  }, [isConnected, currentPlayer?.id]);
 
   const updatePlayerName = useCallback(
     async (name: string) => {
       if (!currentPlayer) return;
-
       try {
         const updatedPlayer = { ...currentPlayer, name };
         setCurrentPlayer(updatedPlayer);
         setPlayers((prevPlayers) =>
           prevPlayers.map((p) => (p.id === currentPlayer.id ? updatedPlayer : p))
         );
-        
-        // Обновляем имя в базе данных, что вызовет real-time событие для других клиентов
         await updatePlayerNameInDb(currentPlayer.id, name);
       } catch (err) {
         console.error('Error updating player name:', err);
-        // Можно добавить логику отката имени, если нужно
       }
     },
     [currentPlayer]
   );
-
+  
   return {
     players,
+    setPlayers,
     currentPlayer,
     isConnected,
     error,
-    handlePlayerMove,
     updatePlayerName,
   };
 };

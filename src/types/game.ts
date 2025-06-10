@@ -4,6 +4,8 @@ export interface Player {
   x: number;
   y: number;
   color: string;
+  targetX?: number;
+  targetY?: number;
 }
 
 export interface GameConfig {
