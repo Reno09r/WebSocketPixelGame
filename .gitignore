@@ -28,3 +28,4 @@ dist-ssr
 /server/node_modules
 .cursorrules
 .bolt
+/server/.env

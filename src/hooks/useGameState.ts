@@ -5,8 +5,6 @@ import { v4 as uuidv4 } from 'uuid';
 import { Player, GameConfig } from '../types/game';
 import {
   addPlayer,
-  getPlayers,
-  removePlayer,
   subscribeToPlayers,
   updatePlayerPosition,
   updatePlayerName as updatePlayerNameInDb,
@@ -36,6 +34,7 @@ export const useGameState = (
 
   const lastUpdateTime = useRef<number>(0);
 
+  // Основной useEffect для создания и удаления игрока. Запускается один раз.
   useEffect(() => {
     let playerId: string | null = null;
     let isMounted = true;
@@ -55,96 +54,65 @@ export const useGameState = (
           color: playerColor,
         };
         
-        console.log('Adding new player to database:', newPlayer);
         await addPlayer(newPlayer);
         
-        if (!isMounted) {
-          console.log('Component unmounted during setup, cleaning up...');
-          if (playerId) await removePlayer(playerId);
-          return;
-        }
+        if (!isMounted) return;
         
         setCurrentPlayer(newPlayer);
+        // Добавляем текущего игрока в общий список сразу
+        setPlayers([newPlayer]);
         
-        console.log('Fetching initial players list...');
-        const initialPlayers = await getPlayers();
-        console.log('Initial players:', initialPlayers);
-        
-        setPlayers(initialPlayers);
+        // Подключаемся к WebSocket, передавая наш ID
+        gameWebSocket.connect(newPlayer.id);
+
+        // Отправляем сообщение о том, что мы присоединились, со всеми нашими данными
+        gameWebSocket.sendPlayerJoined({ ...newPlayer });
+
         setIsConnected(true);
-
-        // Connect to WebSocket
-        console.log('Connecting to WebSocket...');
-        gameWebSocket.connect();
-
-        // Отправляем сообщение о подключении игрока
-        gameWebSocket.sendPlayerJoined({
-          id: newPlayer.id,
-          name: newPlayer.name,
-          color: newPlayer.color
-        });
 
       } catch (err) {
         console.error('Error setting up game:', err);
-        setError('Failed to connect to the game server. Please check your connection and try again.');
-        setIsConnected(false);
+        setError('Failed to connect to the game server. Please check your connection.');
       }
     };
 
     setupGame();
 
-    const cleanup = async () => {
-      console.log('Cleaning up player session...');
-      if (playerId) {
-        try {
-          // Отправляем уведомление о выходе через WebSocket
-          gameWebSocket.sendPlayerLeft(playerId);
-          // Удаляем игрока из базы данных
-          await removePlayer(playerId);
-        } catch (err) {
-          console.error('Error during cleanup:', err);
-        }
-      }
+    const cleanup = () => {
+      console.log('Cleaning up game session...');
+      // Клиенту больше не нужно удалять себя из БД. Сервер сделает это по событию 'close'.
       gameWebSocket.disconnect();
     };
 
-    const handleBeforeUnload = async (event: BeforeUnloadEvent) => {
-      event.preventDefault();
-      await cleanup();
-    };
-
-    const handleVisibilityChange = async () => {
-      if (document.visibilityState === 'hidden') {
-        await cleanup();
-      }
-    };
-
-    const handlePageHide = async () => {
-      await cleanup();
-    };
-
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    window.addEventListener('pagehide', handlePageHide);
-
+    // Упрощенный cleanup при закрытии вкладки/окна
+    window.addEventListener('beforeunload', cleanup);
+    
     return () => {
-      console.log('Component unmounting, cleaning up...');
       isMounted = false;
-      window.removeEventListener('beforeunload', handleBeforeUnload);
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-      window.removeEventListener('pagehide', handlePageHide);
+      window.removeEventListener('beforeunload', cleanup);
       cleanup();
     };
   }, [initialName, gameConfig]);
 
+  // Отдельный useEffect для обработки сообщений и подписок
   useEffect(() => {
-    if (!isConnected) return;
+    // Ждем, пока установится соединение и появится ID текущего игрока
+    if (!isConnected || !currentPlayer?.id) return;
 
-    // WebSocket message handler
-    const unsubscribe = gameWebSocket.onMessage((message) => {
+    // Обработчик сообщений WebSocket
+    const handleWsMessage = (message: any) => { // Используем 'any' для гибкости payload
       console.log('Processing WebSocket message:', message);
       
       switch (message.type) {
+        case 'game_state':
+          // Устанавливаем список игроков, полученных от сервера
+          setPlayers(prev => {
+            const existingIds = new Set(prev.map(p => p.id));
+            const newPlayers = message.payload.players.filter((p: Player) => !existingIds.has(p.id));
+            return [...prev, ...newPlayers];
+          });
+          break;
+
         case 'position':
           const { playerId, x, y } = message.payload;
           if (playerId !== currentPlayer?.id && x !== undefined && y !== undefined) {
@@ -155,20 +123,15 @@ export const useGameState = (
           break;
 
         case 'player_joined':
-          const { playerId: joinedPlayerId, name, color } = message.payload;
-          if (joinedPlayerId !== currentPlayer?.id) {
+          // Сервер присылает полный объект игрока
+          const newPlayerData: Player = message.payload;
+          if (newPlayerData.id !== currentPlayer?.id) {
             setPlayers(prev => {
-              if (prev.some(p => p.id === joinedPlayerId)) {
+              // Избегаем дублирования, если игрок уже есть в списке
+              if (prev.some(p => p.id === newPlayerData.id)) {
                 return prev;
               }
-              const player: Player = {
-                id: joinedPlayerId,
-                name: name || `Player-${joinedPlayerId.substring(0, 4)}`,
-                x: 0,
-                y: 0,
-                color: color || getRandomColor()
-              };
-              return [...prev, player];
+              return [...prev, newPlayerData];
             });
           }
           break;
@@ -179,67 +142,32 @@ export const useGameState = (
           break;
 
         default:
-          console.warn('Unknown message type:', message.type);
+          console.warn('Unknown WebSocket message type:', message.type);
       }
-    });
+    };
 
-    // Supabase subscription for player management
+    const unsubscribeWs = gameWebSocket.onMessage(handleWsMessage);
+
+    // Подписка на Supabase для обновлений (имя, цвет и т.д.),
+    // но не для добавления/удаления игроков, так как это теперь делается через WebSocket.
     const subscription = subscribeToPlayers(
       (updatedPlayers: Player[], eventType: string) => {
         const playerRecord = updatedPlayers[0];
-        if (!playerRecord) {
-          console.warn('Received empty player record in event:', eventType);
-          return;
-        }
-
-        console.log('Processing player event:', {
-          type: eventType,
-          playerId: playerRecord.id,
-          playerName: playerRecord.name
-        });
-
-        switch (eventType) {
-          case 'INSERT':
-            setPlayers((prev) => {
-              // Проверяем, не является ли это текущим игроком
-              if (playerRecord.id === currentPlayer?.id) {
-                console.log('Ignoring INSERT event for current player');
-                return prev;
-              }
-              console.log('Adding new player to state:', playerRecord);
-              return [...prev, playerRecord];
-            });
-            break;
-          case 'UPDATE':
-            setPlayers((prev) => {
-              // Если это текущий игрок, сохраняем его текущую позицию
-              if (playerRecord.id === currentPlayer?.id) {
-                console.log('Updating current player while preserving position');
-                return prev.map((p) => {
-                  if (p.id === currentPlayer.id) {
-                    return {
-                      ...playerRecord,
-                      x: currentPlayer.x,
-                      y: currentPlayer.y,
-                    };
-                  }
-                  return p;
-                });
-              }
-              console.log('Updating player in state:', playerRecord);
-              return prev.map((p) => 
-                p.id === playerRecord.id ? { ...p, ...playerRecord } : p
-              );
-            });
-            break;
-          case 'DELETE':
-            setPlayers((prev) => {
-              console.log('Removing player from state:', playerRecord.id);
-              return prev.filter((p) => p.id !== playerRecord.id);
-            });
-            break;
-          default:
-            console.warn('Unknown event type:', eventType);
+        if (!playerRecord) return;
+        
+        // Обновляем только данные других игроков, чтобы избежать конфликтов с локальным состоянием
+        if (eventType === 'UPDATE' && playerRecord.id !== currentPlayer?.id) {
+           console.log('Received Supabase UPDATE for other player:', playerRecord.id);
+           setPlayers((prev) =>
+             prev.map((p) =>
+               p.id === playerRecord.id ? { ...p, ...playerRecord } : p
+             )
+           );
+        } else if (eventType === 'UPDATE' && playerRecord.id === currentPlayer?.id) {
+            // Если пришло обновление для текущего игрока (например, имя изменено с другого устройства)
+            console.log('Received Supabase UPDATE for current player:', playerRecord.name);
+            setCurrentPlayer(prev => prev ? { ...prev, name: playerRecord.name, color: playerRecord.color } : null);
+            setPlayers(prev => prev.map(p => p.id === playerRecord.id ? { ...p, name: playerRecord.name, color: playerRecord.color } : p));
         }
       }
     );
@@ -248,9 +176,9 @@ export const useGameState = (
       if (subscription) {
         subscription.unsubscribe();
       }
-      unsubscribe();
+      unsubscribeWs();
     };
-  }, [isConnected, currentPlayer]);
+  }, [isConnected, currentPlayer?.id]); // <<<< ВАЖНО: Зависимость от currentPlayer.id, а не всего объекта
   
   const handlePlayerMove = useCallback(
     (movement: { up: boolean; down: boolean; left: boolean; right: boolean; }) => {
@@ -267,7 +195,7 @@ export const useGameState = (
       if (x !== currentPlayer.x || y !== currentPlayer.y) {
         const newPlayerState = { ...currentPlayer, x, y };
 
-        // Немедленно обновляем локальное состояние
+        // Немедленно обновляем локальное состояние для плавности
         setCurrentPlayer(newPlayerState);
         setPlayers((prevPlayers) =>
           prevPlayers.map((p) => (p.id === currentPlayer.id ? newPlayerState : p))
@@ -276,9 +204,9 @@ export const useGameState = (
         // Отправляем обновление через WebSocket
         gameWebSocket.sendPosition(currentPlayer.id, x, y);
         
-        // Обновляем в Supabase с задержкой
+        // Обновляем в Supabase с задержкой (throttling)
         const now = Date.now();
-        if (now - lastUpdateTime.current > 100) { // Обновляем Supabase каждые 100мс
+        if (now - lastUpdateTime.current > 100) { // Обновляем Supabase не чаще чем раз в 100мс
           lastUpdateTime.current = now;
           updatePlayerPosition(currentPlayer.id, x, y).catch((err) => {
             console.error('Failed to sync position to Supabase:', err);
@@ -300,9 +228,11 @@ export const useGameState = (
           prevPlayers.map((p) => (p.id === currentPlayer.id ? updatedPlayer : p))
         );
         
+        // Обновляем имя в базе данных, что вызовет real-time событие для других клиентов
         await updatePlayerNameInDb(currentPlayer.id, name);
       } catch (err) {
         console.error('Error updating player name:', err);
+        // Можно добавить логику отката имени, если нужно
       }
     },
     [currentPlayer]
